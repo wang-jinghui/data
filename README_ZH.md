@@ -242,7 +242,43 @@ datasets:
     start_date: 2020-01-01
 ```
 
-## 存储格式
+## 数据存储
+
+### 配置存储位置
+
+DataManager 的存储功能由 `storage` 参数控制，有三种方式指定存储路径：
+
+**方式一：编程方式指定（推荐快速上手）**
+
+```python
+from ml4t.data import DataManager
+from ml4t.data.storage.hive import HiveStorage
+from ml4t.data.storage.backend import StorageConfig
+
+storage = HiveStorage(StorageConfig(base_path="./market_data"))
+dm = DataManager(storage=storage)
+
+# 获取并保存到 ./market_data/<provider>/<frequency>/symbol=<name>/data.parquet
+dm.load("AAPL", "2020-01-01", "2024-12-31", provider="yahoo")
+```
+
+**方式二：配置文件（YAML）指定**
+
+```yaml
+# config.yaml
+storage:
+  path: ~/data/market
+```
+
+```python
+dm = DataManager(config_path="config.yaml")
+```
+
+**方式三：环境变量指定**
+
+设置 `ML4T_DATA_ROOT` 环境变量，默认使用当前工作目录下的 `data/` 子目录。
+
+### 存储格式
 
 数据以 Hive 分区的 Parquet 格式存储：
 
@@ -263,6 +299,31 @@ result = duckdb.execute("""
     WHERE symbol IN ('AAPL', 'MSFT')
     AND date >= '2024-01-01'
 """).pl()
+```
+
+### 常用存储操作
+
+```python
+# 获取并保存
+dm.load("AAPL", "2020-01-01", "2024-12-31", provider="yahoo")
+
+# 导入已有 DataFrame
+from ml4t.data.providers.baostock_provider import BaoStockProvider
+bs = BaoStockProvider()
+data = bs.fetch_ohlcv("sh.600000", "2024-01-01", "2024-12-31")
+dm.import_data(data, "sh.600000", provider="baostock")
+
+# 增量更新
+dm.update("sh.600000", provider="baostock")
+
+# 列出已存储的标的
+dm.list_symbols()
+
+# 查看元数据（时间范围、行数等）
+dm.get_metadata("sh.600000")
+
+# 批量更新所有已存储数据
+dm.update_all(provider="baostock")
 ```
 
 ## 数据校验
