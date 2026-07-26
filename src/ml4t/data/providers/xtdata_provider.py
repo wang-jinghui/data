@@ -198,7 +198,7 @@ class XtDataProvider(BaseProvider):
         df = df.with_columns(
             pl.col("index").cast(pl.Utf8)
             .str.strptime(pl.Date, "%Y%m%d")
-            .cast(pl.Datetime("us", "UTC"))
+            .cast(pl.Datetime("us", "Asia/Shanghai"))
             .alias("timestamp")
         ).drop("index")
 

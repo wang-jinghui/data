@@ -262,7 +262,7 @@ class BaoStockProvider(BaseProvider):
                 pl.col("date")
                 .str.concat(pl.lit(" "))
                 .str.concat(pl.col("time"))
-                .str.strptime(pl.Datetime("us", "UTC"), "%Y-%m-%d %H:%M:%S")
+                .str.strptime(pl.Datetime("us", "Asia/Shanghai"), "%Y-%m-%d %H:%M:%S")
                 .alias("timestamp")
             ).drop("date", "time")
         else:
@@ -270,7 +270,7 @@ class BaoStockProvider(BaseProvider):
             df = df.with_columns(
                 pl.col("date")
                 .str.strptime(pl.Date, "%Y-%m-%d")
-                .cast(pl.Datetime("us", "UTC"))
+                .cast(pl.Datetime("us", "Asia/Shanghai"))
                 .alias("timestamp")
             ).drop("date")
 
