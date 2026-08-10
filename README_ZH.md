@@ -90,7 +90,13 @@ minute_data = bs.fetch_ohlcv("sz.000001", "2024-07-01", "2024-12-31", frequency=
 
 # 批量获取多只 A 股
 batch = bs.fetch_batch_ohlcv(["sh.600000", "sz.000001", "sh.601398"], "2024-01-01", "2024-12-31")
+
+# 指定复权类型（构造时传入）：'1'=后复权, '2'=前复权, '3'=不复权（默认）
+bs_adj = BaoStockProvider(adjustflag="2")
+data = bs_adj.fetch_ohlcv("sh.600000", "2024-01-01", "2024-12-31")
 ```
+
+> **注意（BaoStock 复权限制）**：baostock 仅对 A 股股票提供复权计算。对于 ETF、基金、指数等标的（如 `sh.515880`），服务端会忽略 `adjustflag` 参数，无论传入 '1'/'2'/'3' 均返回不复权数据，请改用其他支持复权的数据源（如 Yahoo Finance）或自行根据除权除息事件计算。
 
 ## 数据源
 
