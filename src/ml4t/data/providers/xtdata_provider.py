@@ -4,16 +4,23 @@
 转换后输出标准长格式 Polars DataFrame。
 
 数据流：
-    xtdata.get_market_data_ex() → dict[symbol, DataFrame(index='YYYYMMDD')]
+    （可选）download_history_data() 增量补齐本地库 → xtdata.get_market_data_ex()
+        → dict[symbol, DataFrame(index='YYYYMMDD')]
         → reset_index + 日期解析 + symbol 列 + 类型转换
         → pl.DataFrame[timestamp, symbol, open, high, low, close, volume, ...]
 
 前置条件：迅投行情客户端已启动。
+
+说明：get_market_data_ex 只能读取本地已下载的数据。默认（auto_download=True）
+每次取数前自动探测本地覆盖情况，存在缺口时调用 download_history_data 增量补齐，
+避免静默返回过期数据；也可通过 download() 显式批量预下载。
 """
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+import threading
+from datetime import datetime, timedelta
+from typing import ClassVar
 
 import pandas as pd
 import polars as pl
@@ -30,6 +37,10 @@ class XtDataProvider(BaseProvider):
 
     通过 xtquant.xtdata.get_market_data_ex() 获取 A 股 ETF 日线数据，
     转换为 ml4t-data 标准 OHLCV 格式。
+
+    默认 auto_download=True：取数前自动探测本地数据覆盖情况，存在缺口时
+    调用 download_history_data 增量补齐（串行），避免 get_market_data_ex
+    静默返回过期数据；也提供 download() 支持批量预下载。
 
     额外保留列：amount（成交额）、suspendFlag（停牌标记）、preClose（前收盘）。
 
@@ -69,6 +80,7 @@ class XtDataProvider(BaseProvider):
         dividend_type: str = "front",
         fill_data: bool = True,
         rate_limit: tuple[int, float] | None = None,
+        auto_download: bool = True,
     ) -> None:
         """初始化 XtDataProvider。
 
@@ -76,6 +88,8 @@ class XtDataProvider(BaseProvider):
             dividend_type: 复权类型，'front'=前复权, 'back'=后复权, 'none'=不复权
             fill_data: 是否填充非交易日数据
             rate_limit: 限流配置 (calls, period_seconds)
+            auto_download: 取数前自动探测本地数据覆盖情况，缺口存在时增量下载
+                （默认 True；关闭后仅读取本地已下载数据）
 
         Raises:
             ImportError: 如果 xtquant 未安装
@@ -91,6 +105,11 @@ class XtDataProvider(BaseProvider):
         super().__init__(rate_limit=rate_limit)
         self._dividend_type = dividend_type
         self._fill_data = fill_data
+        self._auto_download = auto_download
+
+        # 会话内下载缓存: (symbol, period) -> 已确保/已尝试过的最大 end_time 'YYYYMMDD'
+        self._download_cache: dict[tuple[str, str], str] = {}
+        self._download_lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -120,6 +139,10 @@ class XtDataProvider(BaseProvider):
         start_xt = start.replace("-", "")
         end_xt = end.replace("-", "")
         period = self.FREQUENCY_MAP.get(frequency.lower(), "1d")
+
+        # 取数前确保本地数据已下载到 end（默认开启）
+        if self._auto_download:
+            self._ensure_downloaded(symbol, start, end, period)
 
         logger.info(
             "Fetching data from xtdata",
@@ -179,6 +202,170 @@ class XtDataProvider(BaseProvider):
             rows=len(df),
         )
         return df
+
+    def _ensure_downloaded(self, symbol: str, start: str, end: str, period: str) -> None:
+        """确保迅投本地库已下载 [start, end] 区间的数据。
+
+        流程：会话内缓存命中则跳过；否则探测本地最后数据日期，
+        存在缺口时调用 download_history_data 增量补齐，再验证结果。
+
+        Args:
+            symbol: 股票代码，如 '510300.SH'
+            start: 起始日期 'YYYY-MM-DD' (inclusive)
+            end: 截止日期 'YYYY-MM-DD' (inclusive)
+            period: xtdata period 字符串（'1d' / '1w' / '1mon' 等）
+
+        Raises:
+            DataNotAvailableError: 探测或下载失败（如行情客户端未启动）
+        """
+        end_xt = end.replace("-", "")
+        cache_key = (symbol, period)
+
+        # 1. 会话内缓存命中：本次运行已确保/尝试过不早于 end 的下载
+        with self._download_lock:
+            attempted = self._download_cache.get(cache_key)
+            if attempted is not None and attempted >= end_xt:
+                return
+
+        # 2. 探测本地最后数据日期
+        last_date = self._probe_last_date(symbol, period, start, end)
+        if last_date is not None and last_date >= end_xt:
+            # 本地已覆盖，无需下载
+            with self._download_lock:
+                self._download_cache[cache_key] = last_date
+            return
+
+        # 3. 存在缺口 → 增量下载（只补缺口，不重下全量）
+        if last_date is None:
+            dl_start = start.replace("-", "")
+        else:
+            dl_start = (
+                datetime.strptime(last_date, "%Y%m%d") + timedelta(days=1)
+            ).strftime("%Y%m%d")
+
+        logger.info(
+            "Downloading missing xtdata history",
+            symbol=symbol,
+            period=period,
+            start=dl_start,
+            end=end_xt,
+            last_local_date=last_date,
+        )
+
+        from xtquant import xtdata
+
+        try:
+            xtdata.download_history_data(
+                symbol,
+                period=period,
+                start_time=dl_start,
+                end_time=end_xt,
+                incrementally=True,
+            )
+        except Exception as e:
+            logger.error(
+                "xtdata download failed",
+                symbol=symbol,
+                period=period,
+                error=str(e),
+            )
+            raise DataNotAvailableError(
+                "xtdata",
+                symbol,
+                details={"start": start, "end": end, "stage": "download", "error": str(e)},
+            ) from e
+
+        # 4. 验证下载结果（节假日/未来日期可能无进展，仅告警不失败）
+        new_last = self._probe_last_date(symbol, period, start, end)
+        if new_last is not None and new_last < end_xt and new_last == last_date:
+            logger.warning(
+                "xtdata download made no progress",
+                symbol=symbol,
+                period=period,
+                last_local_date=new_last,
+                requested_end=end_xt,
+            )
+
+        with self._download_lock:
+            self._download_cache[cache_key] = end_xt
+
+    def _probe_last_date(self, symbol: str, period: str, start: str, end: str) -> str | None:
+        """探测迅投本地库在 [start, end] 范围内的最后一条数据日期。
+
+        Args:
+            symbol: 股票代码，如 '510300.SH'
+            period: xtdata period 字符串
+            start: 起始日期 'YYYY-MM-DD' (inclusive)
+            end: 截止日期 'YYYY-MM-DD' (inclusive)
+
+        Returns:
+            'YYYYMMDD' 字符串；范围内无数据返回 None
+
+        Raises:
+            DataNotAvailableError: 探测失败（如行情客户端未启动）
+        """
+        from xtquant import xtdata
+
+        try:
+            raw_dict = xtdata.get_market_data_ex(
+                stock_list=[symbol],
+                period=period,
+                start_time=start.replace("-", ""),
+                end_time=end.replace("-", ""),
+                count=1,
+                dividend_type=self._dividend_type,
+                fill_data=False,
+            )
+        except Exception as e:
+            logger.error("xtdata probe failed", symbol=symbol, period=period, error=str(e))
+            raise DataNotAvailableError(
+                "xtdata",
+                symbol,
+                details={"stage": "probe", "error": str(e)},
+            ) from e
+
+        raw_df = raw_dict.get(symbol)
+        if raw_df is None or raw_df.empty:
+            return None
+        return str(raw_df.index[-1])
+
+    def download(
+        self,
+        symbols: str | list[str],
+        start: str,
+        end: str,
+        frequency: str = "daily",
+    ) -> dict[str, str | None]:
+        """批量预下载历史数据到迅投本地库（串行，不做并发）。
+
+        与取数路径共用 _ensure_downloaded：已覆盖的标的自动跳过，
+        只补齐缺口。适合收盘后批量更新本地库，之后取数零额外开销。
+
+        Args:
+            symbols: 股票代码，单个字符串或列表
+            start: 起始日期 'YYYY-MM-DD' (inclusive)
+            end: 截止日期 'YYYY-MM-DD' (inclusive)
+            frequency: 数据频率 (daily, minute, etc.)
+
+        Returns:
+            dict[symbol, last_date]：每只标的下载后本地最后数据日期
+            （'YYYYMMDD'）；失败或范围内无数据为 None
+        """
+        if isinstance(symbols, str):
+            symbols = [symbols]
+
+        period = self.FREQUENCY_MAP.get(frequency.lower(), "1d")
+        results: dict[str, str | None] = {}
+
+        for symbol in symbols:
+            try:
+                self._ensure_downloaded(symbol, start, end, period)
+                results[symbol] = self._probe_last_date(symbol, period, start, end)
+            except Exception as e:
+                logger.warning("Download failed for symbol", symbol=symbol, error=str(e))
+                results[symbol] = None
+
+        return results
 
     def _transform_to_polars(self, raw_df: pd.DataFrame, symbol: str) -> pl.DataFrame:
         """将 xtdata pandas DataFrame 转换为标准 Polars DataFrame。
@@ -244,6 +431,26 @@ class XtDataProvider(BaseProvider):
         start_xt = start.replace("-", "")
         end_xt = end.replace("-", "")
         period = self.FREQUENCY_MAP.get(frequency.lower(), "1d")
+
+        # 批量取数前逐个补齐本地数据（默认开启；串行下载，失败不中断）
+        if self._auto_download:
+            download_failures: list[str] = []
+            for symbol in symbols:
+                try:
+                    self._ensure_downloaded(symbol, start, end, period)
+                except Exception as e:
+                    logger.warning(
+                        "Download failed for symbol",
+                        symbol=symbol,
+                        error=str(e),
+                    )
+                    download_failures.append(symbol)
+            if download_failures:
+                logger.warning(
+                    "Some symbols failed to download",
+                    count=len(download_failures),
+                    symbols=download_failures[:10],
+                )
 
         logger.info(
             "Batch fetching from xtdata",
