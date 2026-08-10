@@ -117,7 +117,45 @@ XtDataProvider(
     dividend_type="front",  # 复权: 'front'=前复权, 'back'=后复权, 'none'=不复权
     fill_data=True,         # 是否填充非交易日
     rate_limit=None,        # 限流: (calls, period_seconds)
+    auto_download=True,     # 取数前自动探测并增量下载缺失数据
 )
+```
+
+---
+
+## 自动下载机制
+
+`get_market_data_ex` 只能读取迅投本地库中**已下载**的数据：未下载过的标的返回空，
+下载截止日早于请求 `end` 时，无论传什么日期都只会返回截至上次下载的数据。
+
+默认 `auto_download=True` 时，每次取数前自动执行：
+
+1. **探测**：轻量查询本地库最后数据日期（`count=1`）
+2. **补齐**：存在缺口时调用 `download_history_data` 增量下载（串行，只补缺口不重下全量）
+3. **取数**：下载完成后再调用 `get_market_data_ex` 返回完整区间数据
+
+同一进程内相同标的与频率的下载结果会被缓存，避免重复触发下载；
+程序重启后缓存清空，重新探测（探测开销极小）。
+
+### 批量预下载
+
+收盘后可用 `download()` 显式批量更新本地库，之后正式取数时探测即可命中，零额外开销：
+
+```python
+provider = XtDataProvider()
+# 返回 dict[symbol, 本地最后数据日期 'YYYYMMDD']，失败或范围内无数据为 None
+results = provider.download(
+    ["510300.SH", "510500.SH", "159915.SZ"],
+    "2025-01-01",
+    "2025-06-30",
+    frequency="daily",
+)
+```
+
+若希望完全在迅投客户端中手动管理下载、取数只读本地库，可关闭自动下载：
+
+```python
+provider = XtDataProvider(auto_download=False)
 ```
 
 ---
@@ -168,6 +206,11 @@ pl.DataFrame[timestamp, symbol, open, high, low, close, volume, ...]
 ### Q: 报错 ImportError: No module named 'xtquant.IPythonApiClient'
 
 xtquant 的 `.pyd` 编译文件只支持 Python 3.6~3.11，不支持 3.12+。请使用 Python 3.11 环境。
+
+### Q: 取到的数据只到某一天，没有更新到请求的截止日？
+
+通常是迅投本地库未下载到请求日期。默认 `auto_download=True` 会自动探测并增量补齐；
+若关闭了自动下载（或想手动控制），请在迅投客户端中下载数据后重试。
 
 ### Q: 额外列会丢失吗？
 
