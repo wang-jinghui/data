@@ -213,6 +213,56 @@ class QmtProvider(BaseProvider):
             return pd.DataFrame()
         return pd.DataFrame.from_dict(serialized)
 
+    @staticmethod
+    def _clean_invalid_rows(raw_df: pd.DataFrame) -> pd.DataFrame:
+        """清理无效行情行：OHLC 全 NaN / 全 0 / volume=0 的常量填充行。
+
+        服务端 fill_data=True 时对本地库无数据的代码返回填充行而非报错：
+        - 完全无效代码：OHLC 全 0
+        - 有效代码但本地缺历史：OHLC 为最新价常量且 volume=0
+        dropna 无法识别这些填充行，需显式过滤，避免静默返回假数据。
+
+        Args:
+            raw_df: 重建的 pandas DataFrame
+
+        Returns:
+            清理后的 pandas DataFrame
+        """
+        ohlc_cols = ["open", "high", "low", "close"]
+        available_ohlc = [c for c in ohlc_cols if c in raw_df.columns]
+        if not available_ohlc:
+            return raw_df
+
+        n_before = len(raw_df)
+
+        # 1) OHLC 全 NaN 行（停牌/上市前填充行）
+        df = raw_df.dropna(subset=available_ohlc, how="all")
+
+        # 2) OHLC 全 0 行（无效代码填充）
+        zero_mask = pd.Series(True, index=df.index)
+        for col in available_ohlc:
+            zero_mask &= df[col].fillna(0) == 0
+
+        # 3) volume=0 且 OHLC 恒定（本地缺历史的常量价格填充）
+        const_mask = pd.Series(False, index=df.index)
+        if "volume" in df.columns:
+            first = df[available_ohlc[0]].fillna(0)
+            same = pd.Series(True, index=df.index)
+            for col in available_ohlc[1:]:
+                same &= df[col].fillna(0) == first
+            const_mask = (df["volume"].fillna(0) == 0) & same
+
+        df = df[~(zero_mask | const_mask)]
+
+        dropped = n_before - len(df)
+        if dropped:
+            logger.warning(
+                "Dropped filled rows (QMT local data may be incomplete)",
+                dropped=dropped,
+                remaining=len(df),
+            )
+        return df
+
     def _fetch_and_transform_data(
         self, symbol: str, start: str, end: str, frequency: str
     ) -> pl.DataFrame:
@@ -254,11 +304,8 @@ class QmtProvider(BaseProvider):
 
         raw_df = self._rebuild_dataframe(raw_dict[symbol])
 
-        # 清理 OHLC 全为空的行（停牌填充行等）
-        ohlc_cols = ["open", "high", "low", "close"]
-        available_ohlc = [c for c in ohlc_cols if c in raw_df.columns]
-        if available_ohlc:
-            raw_df = raw_df.dropna(subset=available_ohlc, how="all")
+        # 清理无效行情行：OHLC 全 NaN（停牌填充）或全 0（无效代码填充）
+        raw_df = self._clean_invalid_rows(raw_df)
 
         if raw_df.empty:
             raise SymbolNotFoundError(
@@ -379,8 +426,6 @@ class QmtProvider(BaseProvider):
         all_frames: list[pl.DataFrame] = []
         failed_symbols: list[str] = []
 
-        ohlc_cols = ["open", "high", "low", "close"]
-
         for symbol in symbols:
             serialized = raw_dict.get(symbol)
             if not serialized:
@@ -389,10 +434,8 @@ class QmtProvider(BaseProvider):
 
             raw_df = self._rebuild_dataframe(serialized)
 
-            # 清理 OHLC 全空行
-            available_ohlc = [c for c in ohlc_cols if c in raw_df.columns]
-            if available_ohlc:
-                raw_df = raw_df.dropna(subset=available_ohlc, how="all")
+            # 清理无效行情行：OHLC 全 NaN（停牌填充）或全 0（无效代码填充）
+            raw_df = self._clean_invalid_rows(raw_df)
             if raw_df.empty:
                 failed_symbols.append(symbol)
                 continue

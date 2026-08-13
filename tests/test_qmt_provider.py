@@ -71,7 +71,7 @@ class FakeQmtServer:
 
 
 def _make_serialized_bars(dates: list[str]) -> dict[str, dict[str, Any]]:
-    """构造服务端 DataFrame.to_dict() 序列化格式（index 为毫秒时间戳）。"""
+    """构造服务端 DataFrame.to_dict() 序列化格式（index 为 'YYYYMMDD' 字符串）。"""
     rows: list[dict[str, Any]] = []
     for i, d in enumerate(dates):
         ts_ms = TS_BASE + i * DAY_MS
@@ -88,7 +88,45 @@ def _make_serialized_bars(dates: list[str]) -> dict[str, dict[str, Any]]:
                 "_date": d,
             }
         )
-    return {f: {str(rows[i]["time"]): rows[i][f] for i in range(len(rows))} for f in FIELDS}
+    return {f: {rows[i]["_date"]: rows[i][f] for i in range(len(rows))} for f in FIELDS}
+
+
+def _make_zero_bars(dates: list[str]) -> dict[str, dict[str, Any]]:
+    """构造服务端对无效代码返回的全 0 填充序列化数据（真实 fill_data 行为）。"""
+    rows: list[dict[str, Any]] = []
+    for i, d in enumerate(dates):
+        rows.append(
+            {
+                "time": TS_BASE + i * DAY_MS,
+                "open": 0.0,
+                "high": 0.0,
+                "low": 0.0,
+                "close": 0.0,
+                "volume": 0,
+                "amount": 0.0,
+                "_date": d,
+            }
+        )
+    return {f: {rows[i]["_date"]: rows[i][f] for i in range(len(rows))} for f in FIELDS}
+
+
+def _make_constant_bars(dates: list[str], price: float = 7.98) -> dict[str, dict[str, Any]]:
+    """构造本地缺历史时服务端的常量价格填充序列化数据（OHLC 恒定 + volume=0）。"""
+    rows: list[dict[str, Any]] = []
+    for i, d in enumerate(dates):
+        rows.append(
+            {
+                "time": TS_BASE + i * DAY_MS,
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": 0,
+                "amount": 0.0,
+                "_date": d,
+            }
+        )
+    return {f: {rows[i]["_date"]: rows[i][f] for i in range(len(rows))} for f in FIELDS}
 
 
 @pytest.fixture
@@ -221,8 +259,13 @@ class TestTimestampParsing:
     def test_index_fallback_ms_timestamp(self, provider):
         """兜底：无 time 列，index 为毫秒时间戳字符串。"""
         bars = _make_serialized_bars(["20250101", "20250102"])
-        bars.pop("time")  # 模拟服务端未返回 time 字段
-        provider.session._transport.handler = _handler_with(bars)
+        # index 改写为毫秒时间戳（旧格式兜底场景）
+        ms_bars = {
+            f: {str(TS_BASE + i * DAY_MS): v for i, v in enumerate(vals.values())}
+            for f, vals in bars.items()
+        }
+        ms_bars.pop("time")  # 模拟服务端未返回 time 字段
+        provider.session._transport.handler = _handler_with(ms_bars)
 
         df = provider._fetch_and_transform_data(
             "510300.SH", "2025-01-01", "2025-01-02", "daily"
@@ -281,6 +324,71 @@ class TestCleanup:
         bars["volume"]["somekey"] = 0
         bars["amount"]["somekey"] = 0.0
         provider.session._transport.handler = _handler_with(bars, allow_nan=True)
+
+        df = provider._fetch_and_transform_data(
+            "510300.SH", "2025-01-01", "2025-01-03", "daily"
+        )
+
+        assert len(df) == 3
+
+    def test_all_zero_ohlc_rows_dropped(self, provider):
+        """服务端对无效代码返回全 0 填充行（真实 fill_data 行为）→ 单标的抛 SymbolNotFoundError。"""
+        provider.session._transport.handler = _handler_with(
+            _make_zero_bars(["20250101", "20250102", "20250103"])
+        )
+
+        from ml4t.data.core.exceptions import SymbolNotFoundError
+
+        with pytest.raises(SymbolNotFoundError):
+            provider._fetch_and_transform_data(
+                "BAD.SZ", "2025-01-01", "2025-01-03", "daily"
+            )
+
+    def test_fetch_batch_zero_filled_symbol_skipped(self, fake_server, provider):
+        """批量：无效代码返回全 0 填充 → 不计入结果集。"""
+        fake_server.local["BAD.SZ"] = _make_zero_bars(["20250101", "20250102", "20250103"])
+
+        df = provider.fetch_batch_ohlcv(
+            ["510300.SH", "BAD.SZ"], "2025-01-01", "2025-01-03", "daily"
+        )
+
+        assert set(df["symbol"].to_list()) == {"510300.SH"}
+        assert len(df) == 3
+
+    def test_constant_price_fill_rows_dropped(self, provider):
+        """本地缺历史：常量价格 + volume=0 填充行被清理 → 单标的抛 SymbolNotFoundError。"""
+        provider.session._transport.handler = _handler_with(
+            _make_constant_bars(["20250101", "20250102", "20250103"])
+        )
+
+        from ml4t.data.core.exceptions import SymbolNotFoundError
+
+        with pytest.raises(SymbolNotFoundError):
+            provider._fetch_and_transform_data(
+                "510500.SH", "2025-01-01", "2025-01-03", "daily"
+            )
+
+    def test_fetch_batch_constant_fill_symbol_skipped(self, fake_server, provider):
+        """批量：本地缺历史的常量价格填充标的 → 不计入结果集。"""
+        fake_server.local["510500.SH"] = _make_constant_bars(["20250101", "20250102"])
+
+        df = provider.fetch_batch_ohlcv(
+            ["510300.SH", "510500.SH"], "2025-01-01", "2025-01-03", "daily"
+        )
+
+        assert set(df["symbol"].to_list()) == {"510300.SH"}
+        assert len(df) == 3
+
+    def test_volume_zero_suspension_row_kept(self, provider):
+        """OHLC 非恒定且 volume=0 的行（如真实停牌行）不被误删。"""
+        bars = _make_serialized_bars(["20250101", "20250102", "20250103"])
+        # 中间行模拟停牌：volume=0 但 OHLC 各异（非恒定）
+        bars["open"]["20250102"] = 10.1
+        bars["high"]["20250102"] = 10.2
+        bars["low"]["20250102"] = 9.9
+        bars["close"]["20250102"] = 10.0
+        bars["volume"]["20250102"] = 0
+        provider.session._transport.handler = _handler_with(bars)
 
         df = provider._fetch_and_transform_data(
             "510300.SH", "2025-01-01", "2025-01-03", "daily"
