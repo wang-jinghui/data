@@ -22,6 +22,11 @@
     - 服务端未暴露历史数据下载接口，故不支持 download() / auto_download
     - 小时线周期为 '1h'（xtdata 为 '60m'）
     - 停牌填充 fill_data 由服务端固定为 True，客户端不可配置
+
+此外提供与 ContextInfo 同名的数据查询接口（get_stock_name / get_open_date /
+get_last_volume / get_sector / get_industry / get_stock_list_in_sector /
+get_weight_in_index / get_risk_free_rate / get_trading_dates / get_longhubang /
+get_total_share），经由服务端 /api/data/* 对应端点转发。
 """
 
 from __future__ import annotations
@@ -114,6 +119,102 @@ class QmtProvider(BaseProvider):
         """Return the provider name."""
         return "qmt"
 
+    def _post_json(
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+        symbol_hint: str = "",
+    ) -> dict[str, Any]:
+        """发送 POST JSON 请求并解析响应（数据查询接口统一入口）。
+
+        Args:
+            endpoint: API 路径（如 '/api/data/stock_name'）
+            payload: JSON 请求体
+            symbol_hint: 错误日志中的标的提示
+
+        Returns:
+            解析后的响应字典
+
+        Raises:
+            NetworkError: HTTP 连接失败（QMT 客户端未启动/服务未加载）
+            DataNotAvailableError: HTTP 错误状态或响应解析失败
+        """
+        url = f"{self._base_url}{endpoint}"
+        self._acquire_rate_limit()
+        try:
+            resp = self.session.post(url, json=payload)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            detail = ""
+            try:
+                detail = str(e.response.json().get("error", ""))
+            except Exception:
+                pass
+            logger.error(
+                "QMT HTTP request failed",
+                status_code=e.response.status_code,
+                error=detail,
+                endpoint=endpoint,
+            )
+            raise DataNotAvailableError(
+                "qmt",
+                symbol_hint,
+                details={
+                    "stage": "http",
+                    "status_code": e.response.status_code,
+                    "error": detail,
+                    "endpoint": endpoint,
+                },
+            ) from e
+        except httpx.RequestError as e:
+            logger.error(
+                "QMT HTTP connection failed", error=str(e), endpoint=endpoint
+            )
+            raise NetworkError(
+                "qmt",
+                message=f"QMT HTTP 服务连接失败: {e}（请确认 QMT 客户端已启动且已加载 HTTP 服务）",
+                details={"endpoint": endpoint},
+            ) from e
+
+        try:
+            return resp.json()
+        except ValueError as e:
+            logger.error(
+                "QMT HTTP response is not valid JSON",
+                error=str(e),
+                endpoint=endpoint,
+            )
+            raise DataNotAvailableError(
+                "qmt",
+                symbol_hint,
+                details={"stage": "parse", "error": str(e), "endpoint": endpoint},
+            ) from e
+
+    @staticmethod
+    def _get_field_or_raise(
+        body: dict[str, Any], key: str, symbol_hint: str = ""
+    ) -> Any:
+        """从响应中提取字段，缺失则抛 DataNotAvailableError。
+
+        Args:
+            body: 响应字典
+            key: 字段名
+            symbol_hint: 错误日志中的标的提示
+
+        Returns:
+            字段值（可能为 None，表示服务端调用失败）
+
+        Raises:
+            DataNotAvailableError: 响应缺少指定字段
+        """
+        if key not in body:
+            raise DataNotAvailableError(
+                "qmt",
+                symbol_hint,
+                details={"stage": "parse", "error": f"response missing '{key}' field"},
+            )
+        return body[key]
+
     def _request_market_data_ex(
         self, symbols: list[str], start: str, end: str, period: str
     ) -> dict[str, dict[str, dict[str, Any]]]:
@@ -132,62 +233,20 @@ class QmtProvider(BaseProvider):
             NetworkError: HTTP 连接失败（QMT 客户端未启动/服务未加载）
             DataNotAvailableError: HTTP 错误状态或响应解析失败
         """
-        url = f"{self._base_url}/api/data/market_data_ex"
-        payload = {
-            "fields": ",".join(self.FIELDS),
-            "stock_code": ",".join(symbols),
-            "period": period,
-            "start_time": start,
-            "end_time": end,
-            "count": -1,
-            "dividend_type": self._dividend_type,
-        }
         symbol_hint = symbols[0] if len(symbols) == 1 else ""
-
-        try:
-            resp = self.session.post(url, json=payload)
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            detail = ""
-            try:
-                detail = str(e.response.json().get("error", ""))
-            except Exception:
-                pass
-            logger.error(
-                "QMT HTTP request failed",
-                status_code=e.response.status_code,
-                error=detail,
-                symbols=symbols,
-            )
-            raise DataNotAvailableError(
-                "qmt",
-                symbol_hint,
-                details={
-                    "stage": "http",
-                    "status_code": e.response.status_code,
-                    "error": detail,
-                    "start": start,
-                    "end": end,
-                },
-            ) from e
-        except httpx.RequestError as e:
-            logger.error("QMT HTTP connection failed", error=str(e))
-            raise NetworkError(
-                "qmt",
-                message=f"QMT HTTP 服务连接失败: {e}（请确认 QMT 客户端已启动且已加载 HTTP 服务）",
-                details={"start": start, "end": end},
-            ) from e
-
-        try:
-            body = resp.json()
-        except ValueError as e:
-            logger.error("QMT HTTP response is not valid JSON", error=str(e))
-            raise DataNotAvailableError(
-                "qmt",
-                symbol_hint,
-                details={"stage": "parse", "error": str(e)},
-            ) from e
-
+        body = self._post_json(
+            "/api/data/market_data_ex",
+            {
+                "fields": ",".join(self.FIELDS),
+                "stock_code": ",".join(symbols),
+                "period": period,
+                "start_time": start,
+                "end_time": end,
+                "count": -1,
+                "dividend_type": self._dividend_type,
+            },
+            symbol_hint,
+        )
         data = body.get("data")
         if not isinstance(data, dict):
             raise DataNotAvailableError(
@@ -468,3 +527,245 @@ class QmtProvider(BaseProvider):
             )
 
         return result
+
+    # ------------------------------------------------------------------
+    # ContextInfo 同名数据查询接口（经由服务端 /api/data/* 转发）
+    # 方法名与 QMT ContextInfo 保持一致，返回类型与原方法对齐。
+    # 服务端 safe_call 调用失败时关键字段为 None：返回 None 并记录 warning。
+    # ------------------------------------------------------------------
+
+    def get_stock_name(self, stockcode: str) -> str | None:
+        """根据代码获取股票名称（ContextInfo.get_stock_name）。
+
+        Args:
+            stockcode: 股票代码，如 '600000.SH'
+
+        Returns:
+            股票名称；服务端调用失败返回 None
+        """
+        body = self._post_json(
+            "/api/data/stock_name", {"stockcode": stockcode}, stockcode
+        )
+        name = self._get_field_or_raise(body, "name", stockcode)
+        if name is None:
+            logger.warning("QMT get_stock_name returned None", stockcode=stockcode)
+        return name
+
+    def get_open_date(self, stockcode: str) -> int | None:
+        """根据代码获取上市时间（ContextInfo.get_open_date）。
+
+        服务端 get_open_date 为 QMT 策略环境内置全局函数，HTTP 服务（运行于
+        init）中不可用，故改由 /api/data/instrumentdetail 的 OpenDate 字段
+        （IPO 日期，见官方文档 get_instrumentdetail）获取。
+
+        Args:
+            stockcode: 股票代码，如 '600000.SH'
+
+        Returns:
+            上市日期整数 'YYYYMMDD'（如 19991110）；查询失败返回 None
+        """
+        body = self._post_json(
+            "/api/data/instrumentdetail", {"stockcode": stockcode}, stockcode
+        )
+        detail = body.get("detail")
+        open_date = detail.get("OpenDate") if isinstance(detail, dict) else None
+        if open_date is None:
+            logger.warning("QMT get_open_date returned None", stockcode=stockcode)
+        return open_date
+
+    def get_last_volume(self, stockcode: str) -> float | None:
+        """获取最新流通股本（ContextInfo.get_last_volume）。
+
+        Args:
+            stockcode: 股票代码，如 '600000.SH'
+
+        Returns:
+            最新流通股本（股）；服务端调用失败返回 None
+        """
+        body = self._post_json(
+            "/api/data/last_volume", {"stockcode": stockcode}, stockcode
+        )
+        last_volume = self._get_field_or_raise(body, "last_volume", stockcode)
+        if last_volume is None:
+            logger.warning(
+                "QMT get_last_volume returned None", stockcode=stockcode
+            )
+        return last_volume
+
+    def get_total_share(self, stockcode: str) -> float | None:
+        """获取总股本（ContextInfo.get_total_share）。
+
+        Args:
+            stockcode: 股票代码，如 '600000.SH'
+
+        Returns:
+            总股本（股）；服务端调用失败返回 None
+        """
+        body = self._post_json(
+            "/api/data/total_share", {"stockcode": stockcode}, stockcode
+        )
+        total_share = self._get_field_or_raise(body, "total_share", stockcode)
+        if total_share is None:
+            logger.warning("QMT get_total_share returned None", stockcode=stockcode)
+        return total_share
+
+    def get_sector(self, sector: str, realtime: int = 0) -> list[str]:
+        """获取指数成分股（ContextInfo.get_sector）。
+
+        Args:
+            sector: 指数代码，如 '000300.SH'（沪深300）
+            realtime: 是否实时获取，0=历史快照，1=实时
+
+        Returns:
+            成分股代码列表
+        """
+        body = self._post_json(
+            "/api/data/sector", {"sector": sector, "realtime": realtime}, sector
+        )
+        return self._get_field_or_raise(body, "stocks", sector)
+
+    def get_industry(self, industry: str) -> list[str]:
+        """获取行业成分股（ContextInfo.get_industry）。
+
+        Args:
+            industry: 行业分类名，形式为 '分类代码+行业名'，如 'CSRC1金融业'、
+                'SW1银行'（分类代码 CSRC=证监会，SW=申万；行业名可先通过
+                get_industry_name_of_stock 反查）
+
+        Returns:
+            成分股代码列表
+        """
+        body = self._post_json(
+            "/api/data/industry", {"industry": industry}, industry
+        )
+        return self._get_field_or_raise(body, "stocks", industry)
+
+    def get_stock_list_in_sector(self, sectorname: str, realtime: int = 0) -> list[str]:
+        """获取板块成分股（ContextInfo.get_stock_list_in_sector）。
+
+        Args:
+            sectorname: 板块名（无空格，与客户端左侧板块列表一致），如
+                '沪深300'、'中证500'、'上证50'、'我的自选'
+            realtime: 毫秒级时间戳，0 表示取最新成分股（服务端当前版本
+                忽略该参数，仅返回最新成分股）
+
+        Returns:
+            成分股代码列表
+        """
+        body = self._post_json(
+            "/api/data/stock_list_in_sector",
+            {"sectorname": sectorname, "realtime": realtime},
+            sectorname,
+        )
+        return self._get_field_or_raise(body, "stocks", sectorname)
+
+    def get_weight_in_index(self, indexcode: str, stockcode: str) -> float | None:
+        """获取股票在指数中的权重（ContextInfo.get_weight_in_index）。
+
+        Args:
+            indexcode: 指数代码，如 '000300.SH'
+            stockcode: 股票代码，如 '600000.SH'
+
+        Returns:
+            权重，单位 %，如 1.6134 表示 1.6134%；不在指数内或调用失败返回 None
+        """
+        body = self._post_json(
+            "/api/data/weight_in_index",
+            {"indexcode": indexcode, "stockcode": stockcode},
+            stockcode,
+        )
+        weight = self._get_field_or_raise(body, "weight", stockcode)
+        if weight is None:
+            logger.warning(
+                "QMT get_weight_in_index returned None",
+                indexcode=indexcode,
+                stockcode=stockcode,
+            )
+        return weight
+
+    def get_risk_free_rate(self, index: int = -1) -> float | None:
+        """获取无风险利率（ContextInfo.get_risk_free_rate）。
+
+        官方文档：用十年期国债收益率 CGB10Y 作无风险利率。
+
+        Args:
+            index: K 线索引号（barpos），-1 表示最新
+
+        Returns:
+            无风险利率；服务端调用失败返回 None
+        """
+        body = self._post_json("/api/data/risk_free_rate", {"index": index})
+        rate = self._get_field_or_raise(body, "risk_free_rate")
+        if rate is None:
+            logger.warning("QMT get_risk_free_rate returned None", index=index)
+        return rate
+
+    def get_trading_dates(
+        self,
+        stockcode: str,
+        start_date: str,
+        end_date: str,
+        count: int = -1,
+        period: str = "1d",
+    ) -> list:
+        """获取交易日列表（ContextInfo.get_trading_dates）。
+
+        Args:
+            stockcode: 证券代码，如 '510300.SH'
+            start_date: 起始日期，'YYYY-MM-DD' 或 'YYYYMMDD'
+            end_date: 截止日期，'YYYY-MM-DD' 或 'YYYYMMDD'
+            count: 返回数量，-1 表示区间内全部
+            period: 周期（'1d' / '1w' / '1mon' 等）
+
+        Returns:
+            交易日列表；period 为日线时返回 ['20170101', ...] 字符串，
+            其他周期返回时间戳。注意：官方文档注明该接口在 init 函数中
+            不可用，而 HTTP 服务运行于 init，服务端可能返回空列表
+        """
+        body = self._post_json(
+            "/api/data/trading_dates",
+            {
+                "stockcode": stockcode,
+                "start_date": start_date.replace("-", ""),
+                "end_date": end_date.replace("-", ""),
+                "count": count,
+                "period": period,
+            },
+            stockcode,
+        )
+        return self._get_field_or_raise(body, "dates", stockcode)
+
+    def get_longhubang(
+        self, stock_list: list[str], startTime: str, endTime: str
+    ) -> Any:
+        """获取龙虎榜数据（ContextInfo.get_longhubang）。
+
+        Args:
+            stock_list: 股票代码列表
+            startTime: 起始日期 'YYYYMMDD'
+            endTime: 截止日期 'YYYYMMDD'
+
+        Returns:
+            服务端返回 DataFrame.to_dict() 序列化结果时重建为 pandas
+            DataFrame；否则返回原始值
+
+        Raises:
+            DataNotAvailableError: 服务端返回 error 或 HTTP 错误
+        """
+        joined = ",".join(stock_list)
+        body = self._post_json(
+            "/api/data/longhubang",
+            {"stock_list": joined, "startTime": startTime, "endTime": endTime},
+            joined,
+        )
+        if "error" in body:
+            raise DataNotAvailableError(
+                "qmt",
+                joined,
+                details={"stage": "server", "error": body["error"]},
+            )
+        data = body.get("data")
+        if isinstance(data, dict) and data:
+            # DataFrame.to_dict() 序列化：{列名: {行索引: 值}}
+            return self._rebuild_dataframe(data)
+        return data
