@@ -97,6 +97,7 @@ class QmtProvider(BaseProvider):
         dividend_type: str = "front",
         rate_limit: tuple[int, float] | None = None,
         session_config: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> None:
         """初始化 QmtProvider。
 
@@ -106,11 +107,17 @@ class QmtProvider(BaseProvider):
             dividend_type: 复权类型，'front'=前复权, 'back'=后复权, 'none'=不复权
             rate_limit: 限流配置 (calls, period_seconds)
             session_config: 额外 httpx.Client 配置（如 timeout）
+            timeout: 请求超时秒数，覆盖默认 30s。大批量/长历史请求时
+                服务端耗时可达数十秒（实测上千标的 20 年数据约 94s），
+                建议按需调大，如 timeout=180。与 session_config["timeout"]
+                等价，同时给出时以本参数为准
         """
         self._base_url = base_url.rstrip("/")
         self._dividend_type = dividend_type
 
         config = dict(session_config or {})
+        if timeout is not None:
+            config["timeout"] = timeout
         config["headers"] = {"X-Token": token, **(config.get("headers") or {})}
         super().__init__(rate_limit=rate_limit, session_config=config)
 
