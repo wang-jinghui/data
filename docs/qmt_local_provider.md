@@ -109,12 +109,32 @@ BJ    10    5 2024-01-15~2026-08-14 rows=2    stale=6
 ### 批量读取
 
 ```python
-symbols = ["000001.SZ", "000002.SZ", "600004.SH"]
-df = provider.fetch_batch_ohlcv(symbols, "2024-01-01", "2024-06-30", frequency="daily")
+symbols = provider.get_stock_list_in_sector("沪市基金")
+df = provider.fetch_batch_ohlcv(symbols, "2024-01-01", "2024-06-30", "daily")
 print(df.group_by("symbol").len())
 ```
 
-单个标的缺缓存不会中断整体，失败标的记入日志 warning；全部失败时返回空表。
+默认显示 tqdm 进度条（`QMT daily: 100%|██████████| 1117/1117 [00:12<00:00, 88.8sym/s]`），调试或 CI 里可关闭：
+
+```python
+df = provider.fetch_batch_ohlcv(symbols, "2024-01-01", "2024-06-30", "daily", show_progress=False)
+```
+
+单个标的缺缓存不会中断整体：正常读取**零日志**，结束时若有失败标的只打一条汇总 warning（`Some symbols failed count=2 total=23 symbols=[...]`）；全部失败时返回空表并打 error。
+
+### 日志与进度
+
+本地读取的正常路径不打任何日志，噪音已全部收敛：
+
+| 场景 | 输出 |
+|---|---|
+| 构造 provider | 无（不初始化限流器 / httpx 会话） |
+| `fetch_ohlcv()` 单标的 | 无 |
+| `fetch_batch_ohlcv()` 全部成功 | 仅进度条 |
+| `fetch_batch_ohlcv()` 有失败 | 进度条 + 1 条 warning（含失败数、总数、前 10 个标的） |
+| 全部失败 | 1 条 error（`No data read for any symbol`） |
+
+进度条依赖 `tqdm`（可选依赖，缺失时自动忽略，不影响功能）。tqdm 写 **stderr**，因此 `2>&1` 重定向时会与数据流混在一起。
 
 ### 通过 DataManager 注册使用
 
@@ -171,13 +191,13 @@ QmtLocalProvider(
     data_dir=None,                        # datadir 路径；None 表示自动发现
     dividend_type="front",                # 复权: 'front'=前复权, 'back'=后复权, 'none'=不复权
     ex_rights_threshold=0.01,             # 判定除权事件的最小价差（元）
-    rate_limit=None,                      # 限流: (calls, period_seconds)，默认 (100_000, 1.0)
-    session_config=None,                  # BaseProvider 会话配置（本地读取不使用 HTTP）
+    rate_limit=None,                      # 已废弃，仅为兼容旧调用保留
+    session_config=None,                  # 已废弃，仅为兼容旧调用保留
     search_roots=None,                    # 自动发现的扫描起点（默认各本地磁盘根）
 )
 ```
 
-> 纯本地文件读取没有远端配额，`DEFAULT_RATE_LIMIT` 放宽到 `(100_000, 1.0)`，避免限流拖慢批量读取。
+> 本地读取不经过 HTTP，初始化时**不会**创建 `httpx.Client`、也**不会**注册全局限流器（`rate_limit` / `session_config` 仅保留签名兼容）。`fetch_ohlcv()` 同时覆盖了基类模板：保留入参/输出校验，但去掉重试与熔断——本地读取没有远端配额，「文件被客户端独占写」这类错误重试只会把报错延迟 4~10 秒。
 
 ---
 
@@ -441,6 +461,14 @@ provider.coverage("1m")    # 分钟线覆盖通常极小
 ### Q: `get_weight_in_index()` 报 NotImplementedError？
 
 指数权重存在 `datadir/Weight/` 的 LevelDB 中（`.ldb` / `.log` / `MANIFEST-*`），纯 Python 解析需要 leveldb 绑定，不在本 provider 范围内。需要指数权重请用 [QmtProvider](./qmt_provider.md)。
+
+### Q: 传入 `rate_limit=(...)` 会生效吗？
+
+不会。本地文件读取没有远端配额，限流器与 HTTP 会话都不再初始化，参数仅为兼容旧调用保留；`session_config` 同理被忽略。
+
+### Q: 批量读取时看不到任何日志，是没跑吗？
+
+正常。逐标的日志已移除，成功时只有进度条；失败标的在结束时汇总成一条 warning。需要逐标的细节可先 `show_progress=False` 再自己包一层循环统计。
 
 ### Q: 报 `ValueError: Sector 'xxx' is ambiguous`？
 

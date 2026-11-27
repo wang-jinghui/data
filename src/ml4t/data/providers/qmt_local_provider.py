@@ -29,6 +29,7 @@ XtDataProvider 一致的标准长格式 Polars DataFrame。
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, ClassVar, Final, cast
 
@@ -49,6 +50,11 @@ from ml4t.data.providers.qmt_datadir import (
 )
 
 logger = structlog.get_logger()
+
+try:  # tqdm 为可选依赖：缺失时 fetch_batch_ohlcv 不显示进度条
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None  # type: ignore[assignment,misc]
 
 # 标准列（canonical schema），其余列作为额外列追加在后
 _STD_COLUMNS: tuple[str, ...] = (
@@ -149,8 +155,8 @@ class QmtLocalProvider(BaseProvider):
             ex_rights_threshold: 判定除权事件的最小价差（元），默认 0.01。
                 不超过一个最小价位的差值视为舍入噪声，避免把 ±0.01 的
                 噪声放大成假收益
-            rate_limit: 限流配置 (calls, period_seconds)，默认极宽松
-            session_config: BaseProvider 会话配置（本地读取不使用 HTTP）
+            rate_limit: 已废弃，仅为兼容旧调用保留（本地文件读取不做限流）
+            session_config: 已废弃，仅为兼容旧调用保留（本地读取无 HTTP 会话）
             search_roots: 自动发现时扫描的起始目录（默认为各本地磁盘根）
 
         Raises:
@@ -166,7 +172,13 @@ class QmtLocalProvider(BaseProvider):
         self._dividend_type = dividend_type
         self._ex_rights_threshold = ex_rights_threshold
 
-        super().__init__(rate_limit=rate_limit, session_config=session_config)
+        # 本地文件读取不经过 HTTP：跳过 BaseProvider 的限流器与 httpx 会话初始化，
+        # 只保留熔断器（基类 fetch_ohlcv 模板会用到）。不初始化限流器时
+        # _rate_limit_initialized 保持 False，_acquire_rate_limit() 直接放行。
+        del rate_limit, session_config
+        self.logger = structlog.get_logger(name=self.__class__.__name__)
+        self._log_close_events = os.getenv("ML4T_LOG_PROVIDER_CLOSE", "0") == "1"
+        self.init_circuit_breaker()
 
     @property
     def name(self) -> str:
@@ -337,6 +349,32 @@ class QmtLocalProvider(BaseProvider):
     # 取数
     # ------------------------------------------------------------------
 
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+        frequency: str = "daily",
+    ) -> pl.DataFrame:
+        """读取单个标的的 OHLCV 数据（覆盖基类模板）。
+
+        校验与输出规范化与基类一致，但**不打 info 日志**、不做重试与熔断：
+        本地文件读取既无远端配额，也不存在瞬时可恢复故障，重试只会把
+        「文件被客户端独占写」这类错误延迟 4~10 秒才报出。
+
+        Args:
+            symbol: 证券代码，如 '600000.SH'（也接受 'SH600000'）
+            start: 起始日期 'YYYY-MM-DD' (inclusive)
+            end: 截止日期 'YYYY-MM-DD' (inclusive)
+            frequency: 数据频率 (daily, minute, weekly, ...)
+
+        Returns:
+            标准 schema 的 Polars DataFrame
+        """
+        self._validate_inputs(symbol, start, end, frequency)
+        data = self._fetch_and_transform_data(symbol, start, end, frequency)
+        return self._validate_ohlcv(data, self.name)
+
     def _fetch_and_transform_data(
         self, symbol: str, start: str, end: str, frequency: str
     ) -> pl.DataFrame:
@@ -364,16 +402,6 @@ class QmtLocalProvider(BaseProvider):
 
         market, code = split_symbol(symbol)
         canonical = f"{code}.{market}"
-
-        logger.info(
-            "Reading data from QMT datadir",
-            symbol=canonical,
-            start=start,
-            end=end,
-            period=period,
-            dividend_type=self._dividend_type,
-            data_dir=str(self._data_dir.root),
-        )
 
         try:
             bars = self._data_dir.read_bars(
@@ -408,19 +436,9 @@ class QmtLocalProvider(BaseProvider):
             ) from exc
 
         if bars.is_empty():
-            logger.warning(
-                "No QMT bars in requested range",
-                symbol=canonical,
-                period=period,
-                start=start,
-                end=end,
-            )
             return self._create_empty_dataframe()
 
-        df = self._transform_to_polars(bars, canonical)
-
-        logger.info("Successfully read QMT datadir data", symbol=canonical, rows=len(df))
-        return df
+        return self._transform_to_polars(bars, canonical)
 
     def _transform_to_polars(self, bars: pl.DataFrame, symbol: str) -> pl.DataFrame:
         """解析层输出 → 标准 schema（补 symbol 列并调整列序）。
@@ -458,11 +476,12 @@ class QmtLocalProvider(BaseProvider):
         start: str,
         end: str,
         frequency: str = "daily",
+        show_progress: bool = True,
     ) -> pl.DataFrame:
         """批量读取多个 symbol 的 OHLCV 数据。
 
         逐个读取本地文件：单个标的失败（无缓存、文件损坏）不会中断整体，
-        失败的标的记录在 warning 日志中。与 QmtProvider.fetch_batch_ohlcv
+        失败的标的在结束时汇总告警。与 QmtProvider.fetch_batch_ohlcv
         返回结构一致（长格式、按 symbol + timestamp 升序）。
 
         Args:
@@ -470,22 +489,19 @@ class QmtLocalProvider(BaseProvider):
             start: 起始日期 'YYYY-MM-DD'
             end: 截止日期 'YYYY-MM-DD'
             frequency: 数据频率
+            show_progress: 是否显示 tqdm 进度条（未安装 tqdm 时自动忽略）
 
         Returns:
             长格式 Polars DataFrame；全部失败时返回空 DataFrame
         """
-        logger.info(
-            "Batch reading from QMT datadir",
-            total_symbols=len(symbols),
-            start=start,
-            end=end,
-            frequency=frequency,
-        )
-
         all_frames: list[pl.DataFrame] = []
         failed_symbols: list[str] = []
 
-        for symbol in symbols:
+        progress: Any = symbols
+        if show_progress and tqdm is not None:
+            progress = tqdm(symbols, desc=f"QMT {frequency}", unit="sym")
+
+        for symbol in progress:
             try:
                 df = self._fetch_and_transform_data(symbol, start, end, frequency)
             except Exception as e:  # noqa: BLE001 - 单标的失败不中断批量
@@ -508,17 +524,11 @@ class QmtLocalProvider(BaseProvider):
 
         result = pl.concat(all_frames).sort(["symbol", "timestamp"])
 
-        logger.info(
-            "Batch read complete",
-            successful_symbols=len(all_frames),
-            failed_symbols=len(failed_symbols),
-            total_rows=len(result),
-        )
-
         if failed_symbols:
             logger.warning(
                 "Some symbols failed",
                 count=len(failed_symbols),
+                total=len(symbols),
                 symbols=failed_symbols[:10],
             )
 
